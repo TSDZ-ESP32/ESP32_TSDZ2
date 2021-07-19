@@ -27,9 +27,10 @@
 
 static const char *TAG = "tsdz_bt";
 
-#define PROFILE_NUM                 2
+#define PROFILE_NUM                 3
 #define TSDZ_PROFILE                0
 #define CYCLING_POWER_PROFILE       1
+#define CYCLING_CSCP_PROFILE		2
 #define ESP_APP_ID                  0x55
 #define SAMPLE_DEVICE_NAME          "TSDZ_ESP32"
 
@@ -49,6 +50,7 @@ static uint8_t adv_config_done       = 0;
 
 uint16_t tsdz_handle_table[IDX_TSDZ_DB_NUM];
 uint16_t cycling_handle_table[IDX_CYCLING_DB_NUM];
+uint16_t cscp_handle_table[IDX_CSCP_DB_NUM];
 
 // if set the client is connected and able to receive notification from Command Characteristic
 volatile uint8_t btCommandReady = 0;
@@ -63,10 +65,14 @@ typedef struct {
 
 static prepare_type_env_t prepare_write_env;
 
-static uint8_t service_uuid[16] = {
+static uint8_t service_uuid128[48] = {
         /* LSB <--------------------------------------------------------------------------------> MSB */
         //first uuid, 16bit, [12],[13] is the value
         0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00,
+		//second uuid, 32bit, [12], [13], [14], [15] is the value
+		// UUIDs are needed to discover sensor from Garmin Watch
+		0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, // add second uuid for Power Sensor
+		0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x16, 0x18, 0x00, 0x00, // add third uuid for CSCP Sensor
 };
 
 /* The length of adv data must be less than 31 bytes */
@@ -76,13 +82,13 @@ static esp_ble_adv_data_t adv_data = {
         .include_txpower     = true,
         .min_interval        = 0x0006, //slave connection min interval, Time = min_interval * 1.25 msec
         .max_interval        = 0x0010, //slave connection max interval, Time = max_interval * 1.25 msec
-        .appearance          = 0x00,
+        .appearance          = 1152, // 1152 = Cyclinc Generic Category (use decimal notation, not hex value!)
         .manufacturer_len    = 0,    //TEST_MANUFACTURER_DATA_LEN,
         .p_manufacturer_data = NULL, //test_manufacturer,
         .service_data_len    = 0,
         .p_service_data      = NULL,
-        .service_uuid_len    = sizeof(service_uuid),
-        .p_service_uuid      = service_uuid,
+        .service_uuid_len    = sizeof(service_uuid128),
+        .p_service_uuid      = service_uuid128,
         .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
 };
 
@@ -93,13 +99,13 @@ static esp_ble_adv_data_t scan_rsp_data = {
         .include_txpower     = true,
         .min_interval        = 0x0006,
         .max_interval        = 0x0010,
-        .appearance          = 0x00,
+		.appearance			 = 1152, // 1152 = Cyclinc Generic Category (use decimal notation, not hex value!)
         .manufacturer_len    = 0, //TEST_MANUFACTURER_DATA_LEN,
         .p_manufacturer_data = NULL, //&test_manufacturer[0],
         .service_data_len    = 0,
         .p_service_data      = NULL,
-        .service_uuid_len    = sizeof(service_uuid),
-        .p_service_uuid      = service_uuid,
+        .service_uuid_len    = sizeof(service_uuid128),
+        .p_service_uuid      = service_uuid128,
         .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
 };
 
@@ -170,6 +176,7 @@ enum {
 
 static void gatts_tsdz_profile_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
 static void gatts_cycling_profile_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
+static void gatts_cscp_profile_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
 
 /* One gatt-based profile one app_id and one gatts_if, this array will store the gatts_if returned by ESP_GATTS_REG_EVT */
 static struct gatts_profile_inst gatts_profile_tab[PROFILE_NUM] = {
@@ -182,7 +189,12 @@ static struct gatts_profile_inst gatts_profile_tab[PROFILE_NUM] = {
         .gatts_cb = gatts_cycling_profile_handler,
         .gatts_if = ESP_GATT_IF_NONE,       /* Not get the gatt_if, so initial is ESP_GATT_IF_NONE */
         .conn_id = 0xffff
-    }
+    },
+	[CYCLING_CSCP_PROFILE] = {
+		.gatts_cb = gatts_cscp_profile_handler,
+		.gatts_if = ESP_GATT_IF_NONE,       /* Not get the gatt_if, so initial is ESP_GATT_IF_NONE */
+		.conn_id = 0xffff
+	}
 };
 
 /* TSDZ Service */
@@ -203,13 +215,14 @@ static const uint16_t GATTS_CHAR_UUID_CYCLING_POWER_MEASUREMENT = 0x2A63;
 // Wheel revs, cCank revs, and Accumulated Energy
 static const uint8_t power_feature_attr[4] = {0x8C,0x00,0x00,0x00};
 
-/* Cycling Speed and Cadence Service
-static const uint16_t GATTS_SERVICE_UUID_CYCLING_POWER          = 0x1816;
-static const uint16_t GATTS_CHAR_UUID_SENSOR_LOCATION           = 0x2A5D;
-static const uint16_t GATTS_CHAR_UUID_CYCLING_POWER_FEATURE     = 0x2A5C;
-static const uint16_t GATTS_CHAR_UUID_CYCLING_POWER_MEASUREMENT = 0x2A5B;
-static const uint8_t power_feature_attr[2] = {0x03,0x00};
-*/
+#define MAX_CSCP_MEASURE_BYTES 11
+static uint8_t cscpMsg[MAX_CSCP_MEASURE_BYTES];
+/* Cycling Speed and Cadence Service */
+static const uint16_t GATTS_SERVICE_UUID_CYCLING_CSCP          = 0x1816;
+static const uint16_t GATTS_CHAR_UUID_CYCLING_CSCP_FEATURE     = 0x2A5C;
+static const uint16_t GATTS_CHAR_UUID_CYCLING_CSCP_MEASUREMENT = 0x2A5B;
+static const uint8_t cscp_feature_attr[2] = {0x03,0x00}; // 0x03 = cadence and speed supported
+
 
 static const uint16_t primary_service_uuid         = ESP_GATT_UUID_PRI_SERVICE;
 static const uint16_t character_declaration_uuid   = ESP_GATT_UUID_CHAR_DECLARE;
@@ -447,6 +460,45 @@ static const esp_gatts_attr_db_t cycling_gatt_db[IDX_CYCLING_DB_NUM] = {
                 (uint8_t *) (&sensor_loction_attr) } }
 };
 
+/* Cycling CSCP Service Full Database Description  */
+static const esp_gatts_attr_db_t cscp_gatt_db[IDX_CSCP_DB_NUM] = {
+		// Service Declaration
+        [IDX_CSCP_SVC] =
+        { { ESP_GATT_AUTO_RSP }, { ESP_UUID_LEN_16,
+                (uint8_t *) &primary_service_uuid, ESP_GATT_PERM_READ,
+                sizeof(uint16_t), sizeof(GATTS_SERVICE_UUID_CYCLING_CSCP),
+                (uint8_t *) &GATTS_SERVICE_UUID_CYCLING_CSCP } },
+        // Characteristic Declaration
+        [IDX_CHAR_CYCLING_CSCP_MEASUREMENT] =
+        { { ESP_GATT_AUTO_RSP }, { ESP_UUID_LEN_16,
+                (uint8_t *) &character_declaration_uuid, ESP_GATT_PERM_READ,
+                CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE,
+                (uint8_t *) &char_prop_notify } },
+        // Characteristic Value
+        [IDX_CHAR_VAL_CYCLING_CSCP_MEASUREMENT] =
+        { { ESP_GATT_AUTO_RSP }, { ESP_UUID_LEN_16,
+                (uint8_t *) &GATTS_CHAR_UUID_CYCLING_CSCP_MEASUREMENT, ESP_GATT_PERM_READ,
+				MAX_CSCP_MEASURE_BYTES, MAX_CSCP_MEASURE_BYTES,
+				(uint8_t *) (&cscpMsg)} },
+        // Client Characteristic Configuration Descriptor
+        [IDX_CHAR_CFG_CYCLING_CSCP_MEASUREMENT] =
+        { { ESP_GATT_AUTO_RSP }, { ESP_UUID_LEN_16,
+                (uint8_t *) &character_client_config_uuid, ESP_GATT_PERM_READ
+                        | ESP_GATT_PERM_WRITE, sizeof(uint16_t),
+                sizeof(tsdz_attr_ccc), (uint8_t *) tsdz_attr_ccc } },
+        // Characteristic Declaration
+        [IDX_CHAR_CYCLING_CSCP_FEATURE] =
+        { { ESP_GATT_AUTO_RSP }, { ESP_UUID_LEN_16,
+                (uint8_t *) &character_declaration_uuid, ESP_GATT_PERM_READ,
+                CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE,
+                (uint8_t *) &char_prop_read } },
+        // Characteristic Value
+        [IDX_CHAR_VAL_CYCLING_CSCP_FEATURE] =
+        { { ESP_GATT_AUTO_RSP }, { ESP_UUID_LEN_16,
+                (uint8_t *) &GATTS_CHAR_UUID_CYCLING_CSCP_FEATURE, ESP_GATT_PERM_READ,
+                sizeof(cscp_feature_attr), sizeof(cscp_feature_attr),
+                (uint8_t*) (&cscp_feature_attr) } }
+};
 
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
@@ -866,6 +918,68 @@ static void gatts_cycling_profile_handler(esp_gatts_cb_event_t event, esp_gatt_i
     }
 }
 
+static void gatts_cscp_profile_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_GATTS_REG_EVT:{
+    	ESP_LOGI(TAG, "C ESP_GATTS_REG_EVT");
+        esp_err_t ret = esp_ble_gatts_create_attr_tab(cscp_gatt_db, gatts_if, IDX_CSCP_DB_NUM, CYCLING_CSCP_PROFILE);
+        if (ret){
+            ESP_LOGE(TAG, "create attr table failed, error code = %x", ret);
+        }
+    }
+    break;
+    case ESP_GATTS_READ_EVT:
+        ESP_LOGI(TAG, "C ESP_GATTS_READ_EVT");
+        break;
+    case ESP_GATTS_WRITE_EVT:
+        //ESP_LOGI(TAG, "C ESP_GATTS_WRITE_EVT");
+        break;
+    case ESP_GATTS_EXEC_WRITE_EVT:
+        ESP_LOGI(TAG, "C ESP_GATTS_EXEC_WRITE_EVT");
+        break;
+    case ESP_GATTS_MTU_EVT:
+        ESP_LOGI(TAG, "C ESP_GATTS_MTU_EVT, MTU %d", param->mtu.mtu);
+        break;
+    case ESP_GATTS_CONF_EVT:
+        //ESP_LOGI(TAG, "ESP_GATTS_CONF_EVT, status = %d, attr_handle %d", param->conf.status, param->conf.handle);
+        break;
+    case ESP_GATTS_START_EVT:
+        ESP_LOGI(TAG, "C SERVICE_START_EVT, status %d, service_handle %d", param->start.status, param->start.service_handle);
+        break;
+    case ESP_GATTS_CONNECT_EVT:
+        ESP_LOGI(TAG, "C ESP_GATTS_CONNECT_EVT, conn_id = %d", param->connect.conn_id);
+        gatts_profile_tab[CYCLING_CSCP_PROFILE].conn_id = param->connect.conn_id;
+        break;
+    case ESP_GATTS_DISCONNECT_EVT:
+        ESP_LOGI(TAG, "C ESP_GATTS_DISCONNECT_EVT");
+    	gatts_profile_tab[CYCLING_CSCP_PROFILE].conn_id = 0xffff;
+        break;
+    case ESP_GATTS_CREAT_ATTR_TAB_EVT:{
+        if (param->add_attr_tab.status != ESP_GATT_OK){
+            ESP_LOGE(TAG, "C create attribute table failed, error code=0x%x", param->add_attr_tab.status);
+        } else if (param->add_attr_tab.num_handle != IDX_CSCP_DB_NUM){
+            ESP_LOGE(TAG, "C create attribute table abnormally, num_handle (%d) \
+                        doesn't equal to IDX_CSCP_DB_NUM(%d)", param->add_attr_tab.num_handle, IDX_CSCP_DB_NUM);
+        } else {
+            ESP_LOGI(TAG, "C create attribute table successfully, the number handle = %d\n",param->add_attr_tab.num_handle);
+            memcpy(cscp_handle_table, param->add_attr_tab.handles, sizeof(cscp_handle_table));
+            esp_ble_gatts_start_service(cscp_handle_table[IDX_CSCP_SVC]);
+        }
+        break;
+    }
+    case ESP_GATTS_STOP_EVT:
+    case ESP_GATTS_OPEN_EVT:
+    case ESP_GATTS_CANCEL_OPEN_EVT:
+    case ESP_GATTS_CLOSE_EVT:
+    case ESP_GATTS_LISTEN_EVT:
+    case ESP_GATTS_CONGEST_EVT:
+    case ESP_GATTS_UNREG_EVT:
+    case ESP_GATTS_DELETE_EVT:
+    default:
+        break;
+    }
+}
 
 static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
 {
@@ -950,6 +1064,12 @@ void tsdz_bt_init(void)
         return;
     }
 
+    ret = esp_ble_gatts_app_register(CYCLING_CSCP_PROFILE);
+    if (ret){
+        ESP_LOGE(TAG, "C gatts app register error, error code = %x", ret);
+        return;
+    }
+
     esp_err_t local_mtu_ret = esp_ble_gatt_set_local_mtu(500);
     if (local_mtu_ret){
         ESP_LOGE(TAG, "set local  MTU failed, error code = %x", local_mtu_ret);
@@ -959,7 +1079,8 @@ void tsdz_bt_init(void)
     /* set the security iocap & auth_req & key size & init key response key parameters to the stack*/
     esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_MITM_BOND;     //bonding with peer device after authentication
     // esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;           //set the IO capability to No output No input
-    esp_ble_io_cap_t iocap = ESP_IO_CAP_OUT;            //set the IO capability to input/output
+    //esp_ble_io_cap_t iocap = ESP_IO_CAP_OUT;            //set the IO capability to input/output
+    esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE; // Set NO-IO to prevent pairing code requirement
 
     uint8_t key_size = 16;      //the key size should be 7~16 bytes
 
@@ -992,6 +1113,10 @@ void tsdz_bt_stop(void)
         ESP_LOGE(TAG, "esp_ble_gatts_app_unregister error, error code = %x", ret);
     }
     ret = esp_ble_gatts_app_unregister(gatts_profile_tab[CYCLING_POWER_PROFILE].gatts_if);
+    if (ret){
+        ESP_LOGE(TAG, "esp_ble_gatts_app_unregister error, error code = %x", ret);
+    }
+    ret = esp_ble_gatts_app_unregister(gatts_profile_tab[CYCLING_CSCP_PROFILE].gatts_if);
     if (ret){
         ESP_LOGE(TAG, "esp_ble_gatts_app_unregister error, error code = %x", ret);
     }
@@ -1115,6 +1240,72 @@ void cycling_bt_update(void) {
     }
 }
 
+void cscp_bt_update(void) {
+
+	static uint32_t last_wheel_revs = 0;
+	static uint16_t last_wheel_time = 0;
+	static uint16_t last_crank_revs = 0;
+	static uint16_t last_crank_time = 0;
+    esp_err_t ret;
+    if (gatts_profile_tab[CYCLING_CSCP_PROFILE].conn_id != 0xffff) {
+        // Client Charactersitic Configuration bit 0 set -> Notification enabled
+        uint16_t l;
+        unsigned i = 0;
+
+        const uint8_t* value;
+        ret = esp_ble_gatts_get_attr_value(cscp_handle_table[IDX_CHAR_CFG_CYCLING_CSCP_MEASUREMENT], &l, &value);
+        if (ret==ESP_OK && l==2 && (value[0]&0x01)) {
+            uint32_t tmp;
+
+            // flags
+			cscpMsg[i++] = (uint8_t)(0x03);
+
+            // Wheel revolutions
+            ESP_LOGI(TAG, "wheel_revolutions:%u", wheel_revolutions);
+            cscpMsg[i++] = (wheel_revolutions & 0xff);
+            cscpMsg[i++] = ((wheel_revolutions>>8) & 0xff);
+            cscpMsg[i++] = ((wheel_revolutions>>16) & 0xff);
+            cscpMsg[i++] = ((wheel_revolutions>>24) & 0xff);
+
+            // last Wheel revolution time (sec/1024)
+			if ( (wheel_revolutions > last_wheel_revs) && (tsdz_status.ui16_wheel_speed_x10 > 0) ) {
+				tmp = (wheel_revolutions - last_wheel_revs) * (uint32_t)tsdz_cfg.ui16_wheel_perimeter * 1024L
+						 / ((uint32_t)tsdz_status.ui16_wheel_speed_x10 * 1000L / 36L);
+				tmp += last_wheel_time;
+				last_wheel_time = tmp & 0xffff;
+			}
+            last_wheel_revs = wheel_revolutions;
+            ESP_LOGI(TAG, "wheel time:%u", last_wheel_time);
+            cscpMsg[i++] = (last_wheel_time & 0xff);
+            cscpMsg[i++] = ((last_wheel_time>>8) & 0xff);
+
+            // Crank revolutions
+            ESP_LOGI(TAG, "crank_revolutions:%u", crank_revolutions);
+            cscpMsg[i++] = (crank_revolutions & 0xff);
+            cscpMsg[i++] = ((crank_revolutions>>8) & 0xff);
+
+            // Crank revolution time (sec/1024) (60*1024/rmp)
+			if ( (crank_revolutions > last_crank_revs) && (tsdz_status.ui8_pedal_cadence_RPM > 0) ) {
+				// N. revs * 60/rpm * 1024
+				tmp = (crank_revolutions - last_crank_revs) * 61440 / tsdz_status.ui8_pedal_cadence_RPM;
+				tmp += last_crank_time;
+				last_crank_time = tmp & 0xffff;
+			}
+
+            last_crank_revs = crank_revolutions;
+            ESP_LOGI(TAG, "crank time:%d", last_crank_time);
+            cscpMsg[i++] = (last_crank_time & 0xff);
+            cscpMsg[i++] = ((last_crank_time>>8) & 0xff);
+
+            ret = esp_ble_gatts_send_indicate(gatts_profile_tab[CYCLING_CSCP_PROFILE].gatts_if, gatts_profile_tab[CYCLING_CSCP_PROFILE].conn_id, cscp_handle_table[IDX_CHAR_VAL_CYCLING_CSCP_MEASUREMENT],
+                    sizeof(cscpMsg), cscpMsg, false);
+            if (ret)
+                ESP_LOGE(TAG, "cycling_bt_update, cycling_cscp notifiation failed, error code = %x", ret);
+            //else
+            	//ESP_LOGI(TAG, "cycling_bt_update done");
+        }
+    }
+}
 void tsdz_bt_notify_command(uint8_t* data, uint8_t length) {
     // Client Charactersitic Configuration bit 0 set -> Notification enabled
 

@@ -8,6 +8,19 @@
 #ifndef MAIN_TSDZ_BT_H_
 #define MAIN_TSDZ_BT_H_
 
+enum
+{
+    IDX_CSCP_SVC,
+
+    IDX_CHAR_CYCLING_CSCP_MEASUREMENT,
+    IDX_CHAR_VAL_CYCLING_CSCP_MEASUREMENT,
+    IDX_CHAR_CFG_CYCLING_CSCP_MEASUREMENT,
+
+    IDX_CHAR_CYCLING_CSCP_FEATURE,
+    IDX_CHAR_VAL_CYCLING_CSCP_FEATURE,
+
+    IDX_CSCP_DB_NUM
+};
 
 enum
 {
@@ -53,6 +66,7 @@ volatile uint8_t btCommandReady;
 void tsdz_bt_init(void);
 void tsdz_bt_update(void);
 void cycling_bt_update(void);
+void cscp_bt_update(void);
 void tsdz_bt_notify_command(uint8_t* value, uint8_t length);
 void tsdz_bt_stop(void);
 
